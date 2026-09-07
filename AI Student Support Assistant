@@ -1,0 +1,168 @@
+import sqlite3
+import json
+import math
+import datetime
+import ollama
+DB_PATH = "college_assistant.db"
+CHAT_MODEL = "llama3.2:1b"
+EMBED_MODEL = "nomic-embed-text"
+# ---------------------------------------------------------------------
+# 1. DATABASE SETUP
+# ---------------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Knowledge base for RAG (syllabus, FAQs, notices, regulations)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            content TEXT,
+            embedding TEXT
+        )
+    """)
+    # Conversation memory
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            message TEXT,
+            timestamp TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+# ---------------------------------------------------------------------
+# 2. INGEST KNOWLEDGE BASE (chunks of syllabus/FAQ/notices text)
+# ---------------------------------------------------------------------
+def embed_text(text: str):
+    resp = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    return resp["embedding"]
+def add_document(source: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    vec = embed_text(content)
+    cur.execute(
+        "INSERT INTO documents (source, content, embedding) VALUES (?, ?, ?)",
+        (source, content, json.dumps(vec)),
+    )
+    conn.commit()
+    conn.close()
+def seed_knowledge_base():
+    """Run once to load sample college info. Replace with real syllabus/FAQ text."""
+    sample_docs = [
+        ("Attendance Policy", "Students must maintain at least 75% attendance to be eligible for final exams."),
+        ("Exam Schedule", "Mid-semester exams are held in the 8th week of the semester. Final exams follow in week 16."),
+        ("Library Hours", "The central library is open Monday to Saturday, 8 AM to 8 PM."),
+        ("Fee Payment", "Semester fees must be paid within the first two weeks of the semester to avoid a late fee."),
+        ("Hostel Notice", "Hostel curfew is 10 PM on weekdays and 11 PM on weekends."),
+    ]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM documents")
+    count = cur.fetchone()[0]
+    conn.close()
+    if count == 0:
+        for source, content in sample_docs:
+            add_document(source, content)
+        print(f"Seeded {len(sample_docs)} documents into knowledge base.")
+# ---------------------------------------------------------------------
+# 3. RAG RETRIEVAL (cosine similarity over stored embeddings)
+# ---------------------------------------------------------------------
+def cosine_similarity(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0
+    return dot / (norm_a * norm_b)
+def retrieve_context(query: str, top_k: int = 3):
+    query_vec = embed_text(query)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT source, content, embedding FROM documents")
+    rows = cur.fetchall()
+    conn.close()
+    scored = []
+    for source, content, emb_json in rows:
+        emb = json.loads(emb_json)
+        score = cosine_similarity(query_vec, emb)
+        scored.append((score, source, content))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    top = scored[:top_k]
+    return [f"[{src}] {content}" for _, src, content in top]
+# ---------------------------------------------------------------------
+# 4. TOOLS (simple functions the model can "call" via keyword routing)
+# ---------------------------------------------------------------------
+def tool_get_current_date(_args=None):
+    return datetime.date.today().strftime("%A, %d %B %Y")
+def tool_days_until(args):
+    """args: {'date': 'YYYY-MM-DD'}"""
+    try:
+        target = datetime.datetime.strptime(args["date"], "%Y-%m-%d").date()
+        delta = (target - datetime.date.today()).days
+        return f"{delta} day(s) remaining until {target}."
+    except Exception as e:
+        return f"Could not calculate: {e}"
+TOOLS = {
+    "get_current_date": tool_get_current_date,
+    "days_until": tool_days_until,
+}
+TOOL_DEFINITIONS = """
+Available tools (respond ONLY with JSON like {"tool": "name", "args": {...}} if you need one, otherwise answer normally):
+- get_current_date: no args. Returns today's date.
+- days_until: args {"date": "YYYY-MM-DD"}. Returns days remaining until that date.
+"""
+def maybe_call_tool(model_reply: str):
+    try:
+        parsed = json.loads(model_reply)
+        if isinstance(parsed, dict) and "tool" in parsed and parsed["tool"] in TOOLS:
+            result = TOOLS[parsed["tool"]](parsed.get("args", {}))
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+# ---------------------------------------------------------------------
+# 5. MEMORY (store + recall recent conversation turns)
+# ---------------------------------------------------------------------
+def save_message(session_id: str, role: str, message: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO conversation (session_id, role, message, timestamp) VALUES (?, ?, ?, ?)",
+        (session_id, role, message, datetime.datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_history(session_id: str, limit: int = 6):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, message FROM conversation WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+        (session_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return list(reversed(rows))  # chronological order
+
+
+# ---------------------------------------------------------------------
+# 6. MAIN CHAT LOOP
+# ---------------------------------------------------------------------
+def ask_assistant(session_id: str, user_query: str):
+    context_chunks = retrieve_context(user_query)
+    context_text = "\n".join(context_chunks)
+
+    history = get_recent_history(session_id)
+    history_text = "\n".join(f"{role}: {msg}" for role, msg in history)
+
+    system_prompt = f"""You are a helpful college student support assistant.
+Use the CONTEXT below to answer questions about college regulations, syllabus, FAQs and notices.
+If the question needs a calculation or today's date, use a TOOL as instructed.
+{TOOL_DEFINITIONS}
+
+CONTEXT:
+{context_text}
