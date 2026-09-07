@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+study_assistant.db
+chroma_db/
+course_materials/*.pdf
+course_materials/*.txt
+.env
+.DS_Store
